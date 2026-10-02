@@ -162,6 +162,33 @@ llama_context::llama_context(
         }
     }
 
+    if (model.arch == LLM_ARCH_QWEN4EXP && !hparams.vocab_only && (model.tok_embd == nullptr || model.output == nullptr)) {
+        if (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            throw std::runtime_error("qwen4exp shared target tensors require an MTP context");
+        }
+        if (params.ctx_other == nullptr) {
+            throw std::runtime_error("qwen4exp shared MTP requires ctx_other to be set (this warning is normal during memory fitting)");
+        }
+
+        const auto * model_other = llama_get_model(params.ctx_other);
+        if (model_other->arch != model.arch || model_other->hparams.n_embd != hparams.n_embd ||
+            model_other->hparams.n_embd_out() != hparams.n_embd_out() ||
+            model_other->vocab.get_type() != model.vocab.get_type() || model_other->vocab.n_tokens() != model.vocab.n_tokens()) {
+            throw std::runtime_error("qwen4exp shared MTP requires a target with matching architecture, embedding widths and vocabulary");
+        }
+        for (const auto * tensor : { model_other->tok_embd, model_other->output }) {
+            if (tensor == nullptr || tensor->ne[0] != hparams.n_embd || tensor->ne[1] != model.vocab.n_tokens() || tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+                throw std::runtime_error("qwen4exp shared MTP requires matching target token embeddings and output projection");
+            }
+        }
+        for (uint32_t i = 0; i < model.vocab.n_tokens(); ++i) {
+            if (model.vocab.get_token_data(i).text != model_other->vocab.get_token_data(i).text) {
+                throw std::runtime_error("qwen4exp shared MTP requires matching target token IDs");
+            }
+        }
+        cparams.ctx_other = params.ctx_other;
+    }
+
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
     }
@@ -357,6 +384,27 @@ llama_context::llama_context(
             throw std::runtime_error("failed to initialize CPU backend");
         }
         backends.emplace_back(backend_cpu);
+
+        if (model.arch == LLM_ARCH_QWEN4EXP && cparams.ctx_other != nullptr && !hparams.no_alloc) {
+            const auto * model_other = llama_get_model(cparams.ctx_other);
+            for (const auto * tensor : { model.tok_embd ? nullptr : model_other->tok_embd,
+                                        model.output   ? nullptr : model_other->output,
+                                        model.output   ? nullptr : model_other->output_s }) {
+                if (tensor == nullptr) {
+                    continue;
+                }
+                if (tensor->buffer == nullptr) {
+                    throw std::runtime_error("qwen4exp shared MTP requires allocated target tensors");
+                }
+                bool supported = false;
+                for (const auto & backend : backends) {
+                    supported |= ggml_backend_supports_buft(backend.get(), ggml_backend_buffer_get_type(tensor->buffer));
+                }
+                if (!supported) {
+                    throw std::runtime_error("qwen4exp shared MTP requires draft devices that support the target tensor buffers");
+                }
+            }
+        }
 
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {

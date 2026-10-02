@@ -9,6 +9,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -580,6 +581,88 @@ static bool check_causal_attn_toggle(
     return ok;
 }
 
+static bool check_qwen4exp_mtp_startup(const uint32_t ratio, const ggml_type cache_type, const size_t seed, const float stdev) {
+    gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    llama_model_saver ms(LLM_ARCH_QWEN4EXP, metadata.get());
+    ms.add_kv(LLM_KV_BLOCK_COUNT, uint32_t(3));
+    ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>({ 4, 4, ratio }));
+
+    llama_model_params mparams = llama_model_default_params();
+    ggml_backend_dev_t devices[] = { nullptr };
+    mparams.devices = devices;
+    mparams.n_gpu_layers = 0;
+    mparams.load_mtp = true;
+    mparams.progress_callback = silent_model_load_progress;
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &tensor_params, mparams));
+    if (!model) {
+        throw std::runtime_error("failed to create MTP test model");
+    }
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    cparams.n_ctx = 256;
+    cparams.n_batch = 64;
+    cparams.n_ubatch = 64;
+    cparams.n_threads = 2;
+    cparams.n_threads_batch = 2;
+    cparams.n_rs_seq = 0;
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cparams.type_k = cache_type;
+    cparams.type_v = cache_type;
+    cparams.offload_kqv = false;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cparams));
+    if (!ctx) {
+        throw std::runtime_error("failed to create MTP test context");
+    }
+
+    if (common_context_can_seq_rm(ctx.get()) != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+        LOG_ERR("%s: MTP startup sequence-removal probe failed\n", __func__);
+        return false;
+    }
+
+    llama_set_embeddings_nextn(ctx.get(), true, true);
+
+    const uint32_t n_tokens = 8;
+    const uint32_t n_embd = llama_model_n_embd_out(model.get());
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const std::vector<float> hidden(n_tokens*n_embd, 0.1f);
+    common_batch batch(ctx.get());
+    for (uint32_t pos = 0; pos < n_tokens; ++pos) {
+        const int32_t idx = batch.add(pos + 1, pos, 0, false);
+        batch.set_embd(idx, { hidden.data() + pos*n_embd, 1, n_embd });
+    }
+    if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0 ||
+        llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) != (llama_pos) n_tokens - 1) {
+        LOG_ERR("%s: MTP catch-up decode failed\n", __func__);
+        return false;
+    }
+    batch.clear();
+    for (uint32_t pos = 0; pos < n_tokens; ++pos) {
+        const int32_t idx = batch.add(pos + 1, n_tokens + pos, 0, true);
+        batch.set_embd(idx, { hidden.data() + pos*n_embd, 1, n_embd });
+    }
+    if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+        LOG_ERR("%s: MTP decode failed\n", __func__);
+        return false;
+    }
+    for (uint32_t row = 0; row < n_tokens; ++row) {
+        const float * logits = llama_get_logits_ith(ctx.get(), row);
+        if (logits == nullptr) {
+            LOG_ERR("%s: MTP decode returned no logits\n", __func__);
+            return false;
+        }
+        for (uint32_t token = 0; token < n_vocab; ++token) {
+            if (!std::isfinite(logits[token])) {
+                LOG_ERR("%s: MTP decode returned a non-finite logit\n", __func__);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -952,6 +1035,22 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
 
                 // log the results for this test case
                 LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
+            }
+        }
+    }
+
+    if (arch_matches(arch_filter, LLM_ARCH_QWEN4EXP) && arch_supported(LLM_ARCH_QWEN4EXP)) {
+        for (uint32_t ratio : { 0, 4 }) {
+            for (ggml_type cache_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                LOG("qwen4exp MTP startup: ratio=%u cache=%s ", ratio, ggml_type_name(cache_type));
+                fflush(stdout);
+                const bool test_ok = check_qwen4exp_mtp_startup(ratio, cache_type, seed, stdev);
+                LOG("%s\n", test_ok ? "OK" : "FAIL");
+                n_tests++;
+                if (!test_ok) {
+                    n_failed++;
+                    all_ok = false;
+                }
             }
         }
     }
