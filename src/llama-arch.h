@@ -735,10 +735,11 @@ enum llm_tensor_layer {
 };
 
 struct LLM_KV {
-    LLM_KV(llm_arch arch, const char * suffix = nullptr);
+    LLM_KV(llm_arch arch, const char * suffix = nullptr, const char * arch_name = nullptr);
 
     llm_arch arch;
     const char * suffix;
+    std::string arch_name;
 
     std::string operator()(llm_kv kv) const;
 };
