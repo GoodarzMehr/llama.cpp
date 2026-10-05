@@ -84,13 +84,17 @@ llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
 ```
 
 - `--flash-attn off` or (`--flash-attn auto` resolving to `off` when it isn't supported) is a hard error.
-- KV cache types must be non-quantized: `f32`, `f16`, or `bf16`. Support for quantized KV cache is not implemented and trying to use it will result in an error.
+- Quantized KV cache support depends on the architecture and the member backends. GLM5-Next supports `-ctk q8_0 -ctv q8_0` with mirrored caches.
 - Mark this configuration as experimental in your tooling: validate output quality before deploying.
 - `--split-mode tensor`is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"*:
 
   - **MoE / hybrid:** Grok, MPT, OLMoE, DeepSeek2, GLM-DSA, Nemotron-H, Nemotron-H-MoE, Granite-Hybrid, LFM2-MoE, Minimax-M2, Mistral4, Kimi-Linear, Jamba, Falcon-H1
   - **State-space / RWKV-style:** Mamba, Mamba2 (and the hybrid Mamba-attention models above)
   - **Other:** PLAMO2, MiniCPM3, Gemma-3n, OLMo2, BitNet, T5
+
+GLM5-Next splits dense, routed-expert and shared-expert feed-forward channels. Its KDA, MLA, indexer, mHC, output projection and caches are replicated on each GPU. This uses more VRAM than layer splitting at the same context size. CPU-offloaded experts execute on CPU; only GPU-resident feed-forward weights are tensor-parallel. The meta backend also replicates source-free `ARANGE` operations used by the indexer.
+
+GLM5-Next supports its embedded NextN head with `--spec-type draft-mtp`, in layer and tensor modes. No separate draft model is needed. Set `-ctkd q8_0 -ctvd q8_0` as well as the target cache types to use Q8_0 for both contexts. MTP loads extra head weights, allocates a draft attention/indexer cache, and adds target recurrent rollback states according to `--spec-draft-n-max`. Tensor mode replicates those caches and states. Image and audio requests use target-only decoding and clear their cached prompts on release; text requests still use MTP. Indexer selection is recomputed for each draft step.
 
 ### 5. With NCCL
 
@@ -118,10 +122,9 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs) 
 | Symptom | How to fix |
 |---|---|
 | Startup error *"SPLIT_MODE_TENSOR requires flash_attn to be enabled"* | Add `-fa on` or remove `-fa off`. |
-| Startup error *"simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented"* | Use `-ctk f16 -ctv f16` (or `bf16`/`f32`) with `--split-mode tensor`. |
 | Startup error *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'X'"* | Architecture not on the TENSOR allow-list. Use `--split-mode layer`. |
 | Warning *"NCCL is unavailable, multi GPU performance will be suboptimal"* | llama.cpp wasn't built with NCCL. Either accept the lower performance or install NCCL and rebuild. |
-| CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |
+| CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. Lower `--ctx-size` (`-c`) to reduce KV memory. Lower `--parallel` (`-np`) to reduce recurrent state and compute memory; with unified KV and an explicit context size, this does not shrink the shared KV pool. Reduce `--n-gpu-layers` (`-ngl`) or offload more experts to CPU if weights still do not fit. |
 | Performance is worse with multi-GPU than single-GPU | The performance is bottlenecked by GPU interconnect speed. For `--split-mode tensor`, verify that NCCL is being used. Try `--split-mode layer` (less communication than `tensor`). Increase GPU interconnect speed via more PCIe lanes or e.g. NVLink (if available). |
 | GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or you are accidentally hiding the GPUs via an environment variable like `CUDA_VISIBLE_DEVICES=-1`. Or your build doesn't include support for the relevant backend. |
 | Crashes or corrupted outputs after setting `GGML_CUDA_P2P=1` | Some motherboards and BIOS settings (e.g. with IOMMU enabled) don't support CUDA peer-to-peer reliably. Unset `GGML_CUDA_P2P`. |

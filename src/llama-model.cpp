@@ -481,6 +481,21 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // aliased cache slots cannot satisfy the meta-split invariants, so replicate all tensors
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }
+        if (ud->model->arch == LLM_ARCH_GLM5_NEXT) {
+            // Keep KDA, MLA and mHC mirrored; split only the feed-forward channels.
+            if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
+                    std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+            }
+            if (!std::regex_match(tensor_name, pattern_ffn_up_weight) &&
+                    !std::regex_match(tensor_name, pattern_ffn_gate_weight) &&
+                    !std::regex_match(tensor_name, pattern_ffn_down_weight)) {
+                return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
+            }
+        }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
                     std::regex_match(tensor_name, pattern_dsv4_state)) {

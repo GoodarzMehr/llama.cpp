@@ -158,7 +158,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_HY_V4) {
         n_embd = 128;
         n_head = 1;
-        n_ff   = 192;
+        n_ff   = arch == LLM_ARCH_GLM5_NEXT ? 384 : 192;
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
     } else if (arch == LLM_ARCH_CHAMELEON) {
@@ -663,6 +663,105 @@ static bool check_qwen4exp_mtp_startup(const uint32_t ratio, const ggml_type cac
     return true;
 }
 
+static bool check_glm5_next_mtp(const std::vector<ggml_backend_dev_t> & devs, llama_split_mode split_mode,
+        ggml_type cache_type, size_t seed, float stdev) {
+    gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    llama_model_saver ms(LLM_ARCH_GLM5_NEXT, metadata.get());
+    ms.add_kv(LLM_KV_BLOCK_COUNT, uint32_t(3));
+    ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, std::vector<uint32_t>({ 1, 0, 1 }));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K, uint32_t(8));
+
+    auto devices = devs;
+    devices.push_back(nullptr);
+    llama_model_params mparams = llama_model_default_params();
+    mparams.devices = devices.data();
+    mparams.split_mode = split_mode;
+    mparams.load_mtp = true;
+    mparams.progress_callback = silent_model_load_progress;
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &tensor_params, mparams));
+    if (!model) {
+        throw std::runtime_error("failed to create GLM MTP test model");
+    }
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    cparams.n_ctx = 256;
+    cparams.n_batch = 64;
+    cparams.n_ubatch = 64;
+    cparams.n_seq_max = 2;
+    cparams.kv_unified = true;
+    cparams.n_rs_seq = 0;
+    cparams.n_threads = 2;
+    cparams.n_threads_batch = 2;
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cparams.type_k = cache_type;
+    cparams.type_v = cache_type;
+    auto target_params = cparams;
+    target_params.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+    target_params.n_rs_seq = 3;
+    llama_context_ptr target(llama_init_from_model(model.get(), target_params));
+    if (!target) {
+        throw std::runtime_error("failed to create GLM MTP target context");
+    }
+    get_logits(model.get(), target.get(), { 1 });
+    target.reset();
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cparams));
+    llama_context_ptr ref(llama_init_from_model(model.get(), cparams));
+    if (!ctx || !ref) {
+        throw std::runtime_error("failed to create GLM MTP test context");
+    }
+    if (common_context_can_seq_rm(ctx.get()) != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+        return false;
+    }
+    llama_set_embeddings_nextn(ctx.get(), true, true);
+    llama_set_embeddings_nextn(ref.get(), true, true);
+
+    const uint32_t n_embd = llama_model_n_embd_out(model.get());
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    auto decode = [&](llama_context * lctx, uint32_t begin, uint32_t end, int seq_begin, int seq_end, bool replacement, bool logits) {
+        common_batch batch(lctx);
+        std::vector<float> hidden((end - begin)*(seq_end - seq_begin)*n_embd);
+        for (int seq = seq_begin; seq < seq_end; ++seq) {
+            for (uint32_t pos = begin; pos < end; ++pos) {
+                const int32_t idx = batch.add(1 + (pos + 17*seq + (replacement ? 32 : 0)) % (n_vocab - 1), pos, seq, logits);
+                float * row = hidden.data() + idx*n_embd;
+                for (uint32_t i = 0; i < n_embd; ++i) {
+                    row[i] = 0.1f + 0.01f*((i + pos + seq) % 7);
+                }
+                batch.set_embd(idx, { row, 1, n_embd });
+            }
+        }
+        return llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+    };
+
+    // The reference never sees the rejected suffix of sequence 0.
+    if (!decode(ctx.get(), 0, 8, 0, 2, false, false) || !decode(ref.get(), 0, 8, 0, 2, false, false) ||
+        !decode(ctx.get(), 8, 16, 0, 2, false, true) || !decode(ref.get(), 8, 16, 1, 2, false, false) ||
+        !llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 8, -1) ||
+        !decode(ctx.get(), 8, 16, 0, 1, true, false) || !decode(ref.get(), 8, 16, 0, 1, true, false) ||
+        !decode(ctx.get(), 16, 17, 0, 2, false, true) || !decode(ref.get(), 16, 17, 0, 2, false, true)) {
+        return false;
+    }
+    std::vector<float> actual, expected;
+    for (uint32_t seq = 0; seq < 2; ++seq) {
+        const float * a = llama_get_logits_ith(ctx.get(), seq);
+        const float * b = llama_get_logits_ith(ref.get(), seq);
+        if (!a || !b) {
+            return false;
+        }
+        for (uint32_t i = 0; i < n_vocab; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+                return false;
+            }
+            actual.push_back(a[i]);
+            expected.push_back(b[i]);
+        }
+    }
+    return nmse(actual, expected) < 1e-6;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -1045,6 +1144,25 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 LOG("qwen4exp MTP startup: ratio=%u cache=%s ", ratio, ggml_type_name(cache_type));
                 fflush(stdout);
                 const bool test_ok = check_qwen4exp_mtp_startup(ratio, cache_type, seed, stdev);
+                LOG("%s\n", test_ok ? "OK" : "FAIL");
+                n_tests++;
+                if (!test_ok) {
+                    n_failed++;
+                    all_ok = false;
+                }
+            }
+        }
+    }
+
+    if (arch_matches(arch_filter, LLM_ARCH_GLM5_NEXT) && arch_supported(LLM_ARCH_GLM5_NEXT)) {
+        for (const auto & dc : dev_configs) {
+            if (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty()) {
+                continue;
+            }
+            for (ggml_type cache_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                LOG("glm5-next MTP rollback: device=%s cache=%s ", dc.label.c_str(), ggml_type_name(cache_type));
+                fflush(stdout);
+                const bool test_ok = check_glm5_next_mtp(dc.devs, dc.split_mode, cache_type, seed, stdev);
                 LOG("%s\n", test_ok ? "OK" : "FAIL");
                 n_tests++;
                 if (!test_ok) {

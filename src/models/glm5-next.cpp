@@ -64,8 +64,7 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
     const int64_t hc         = hparams.dsv4_hc_mult;
     const int64_t hc_mix_dim = (2 + hc)*hc;
 
-    // the NextN block is loaded but only used by the MTP graph.
-    // Separated trunk_only/mtp_only handling TODO with DECODER_MTP graph in the MTP follow up
+    // the NextN block is loaded only when MTP is enabled.
     int mtp_flags = 0;
     if (!ml.load_mtp) {
         mtp_flags |= TENSOR_SKIP;
@@ -187,7 +186,7 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
 
 std::unique_ptr<llm_graph_context> llama_model_glm5_next::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-        throw std::runtime_error("GLM5-Next NextN graph not implemented yet");
+        return std::make_unique<graph_mtp>(*this, params);
     }
     return std::make_unique<graph>(*this, params);
 }
@@ -613,37 +612,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        if ((uint32_t) il < hparams.n_layer_dense_lead) {
-            cur = build_ffn(cur,
-                    layer.ffn_up,   nullptr, nullptr,
-                    layer.ffn_gate, nullptr, nullptr,
-                    layer.ffn_down, nullptr, nullptr,
-                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-            cb(cur, "ffn_out", il);
-        } else {
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                    layer.ffn_gate_inp,
-                    layer.ffn_up_exps,
-                    layer.ffn_gate_exps,
-                    layer.ffn_down_exps,
-                    layer.ffn_exp_probs_b,
-                    n_expert, n_expert_used,
-                    LLM_FFN_SILU, hparams.expert_weights_norm,
-                    hparams.expert_weights_scale,
-                    (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
-            cb(moe_out, "ffn_moe_out", il);
-
-            ggml_tensor * ffn_shexp = build_ffn(cur,
-                    layer.ffn_up_shexp,   nullptr, nullptr,
-                    layer.ffn_gate_shexp, nullptr, nullptr,
-                    layer.ffn_down_shexp, nullptr, nullptr,
-                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-            cb(ffn_shexp, "ffn_shexp", il);
-
-            cur = ggml_add(ctx0, moe_out, ffn_shexp);
-            cb(cur, "ffn_out", il);
-        }
+        cur = build_layer_ffn(cur, layer, il);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
@@ -679,6 +648,116 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
+    graph(model, params, no_build{}) {
+    GGML_ASSERT(hparams.n_layer_nextn == 1 && "GLM5-Next MTP requires a single NextN block");
+    GGML_ASSERT(cparams.nextn_layer_offset == 0);
+    GGML_ASSERT(hparams.n_embd_out() == (uint32_t) n_embd);
+
+    const int il = hparams.n_layer();
+    const auto & layer = model.layers[il];
+    GGML_ASSERT(layer.nextn.eh_proj && layer.nextn.enorm && layer.nextn.hnorm && "load the model with MTP enabled");
+
+    auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd);
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_input(inp->embd);
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    auto * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+    ggml_tensor * tok_embd = ubatch.token ? ggml_get_rows(ctx0, tok_embd_w, inp->tokens) : inp->embd;
+    ggml_tensor * h = inp->h;
+    res->add_input(std::move(inp));
+
+    auto * inp_hyb = build_inp_mem_hybrid_k();
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
+    auto * inp_kpool = build_inp_kpool(mctx_hyb);
+    // The hybrid input needs this allocation even when the draft has no recurrent layers.
+    ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
+
+    ggml_tensor * h_norm = build_norm(h, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
+    cb(cur, "mtp_eh_proj", il);
+
+    ggml_tensor * residual = cur;
+    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * prev_sel = nullptr;
+    cur = build_dsa_layer(cur, layer, mctx_hyb, inp_hyb->get_attn(), inp_kpool, &prev_sel, il);
+    cur = ggml_add(ctx0, cur, residual);
+
+    residual = cur;
+    cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    cur = build_layer_ffn(cur, layer, il);
+    cur = build_cvec(ggml_add(ctx0, cur, residual), il);
+
+    auto * head_norm = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+    cur = build_norm(cur, head_norm, nullptr, LLM_NORM_RMS, il);
+
+    if (n_outputs == 0) {
+        if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) {
+            res->t_h_nextn = cur;
+            cb(cur, "h_nextn", il);
+        }
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * out = inp_out_ids ? ggml_get_rows(ctx0, cur, inp_out_ids) : cur;
+    res->t_h_nextn = cparams.embeddings_nextn_masked ? out : cur;
+    cb(res->t_h_nextn, "h_nextn", il);
+    ggml_build_forward_expand(gf, res->t_h_nextn);
+    res->t_embd = out;
+    cb(out, "result_norm", -1);
+
+    auto * output = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    auto * output_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+    out = build_lora_mm(output, out, output_s);
+    cb(out, "result_output", -1);
+    res->t_logits = out;
+    ggml_build_forward_expand(gf, out);
+}
+
+ggml_tensor * llama_model_glm5_next::graph::build_layer_ffn(ggml_tensor * cur, const llama_layer & layer, int il) {
+    if ((uint32_t) il < hparams.n_layer_dense_lead) {
+        cur = build_ffn(cur,
+                layer.ffn_up,   nullptr, nullptr,
+                layer.ffn_gate, nullptr, nullptr,
+                layer.ffn_down, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(cur, "ffn_out", il);
+    } else {
+        ggml_tensor * moe_out = build_moe_ffn(cur,
+                layer.ffn_gate_inp,
+                layer.ffn_up_exps,
+                layer.ffn_gate_exps,
+                layer.ffn_down_exps,
+                layer.ffn_exp_probs_b,
+                n_expert, n_expert_used,
+                LLM_FFN_SILU, hparams.expert_weights_norm,
+                hparams.expert_weights_scale,
+                (llama_expert_gating_func_type) hparams.expert_gating_func,
+                il);
+        cb(moe_out, "ffn_moe_out", il);
+
+        ggml_tensor * ffn_shexp = build_ffn(cur,
+                layer.ffn_up_shexp,   nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(ffn_shexp, "ffn_shexp", il);
+
+        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        cb(cur, "ffn_out", il);
+    }
+
+    return cur;
 }
 
 // KDA layer, g_a/g_b output gate

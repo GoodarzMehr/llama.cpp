@@ -868,7 +868,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
         ggml_backend_meta_split_state split_state;
         switch (tensor->op) {
-            case GGML_OP_NONE: {
+            case GGML_OP_NONE:
+            case GGML_OP_ARANGE: {
                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             } break;
             case GGML_OP_DUP: {
@@ -996,7 +997,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_PAD_REFLECT_1D:
             case GGML_OP_ROLL:
-            case GGML_OP_ARANGE:
             case GGML_OP_TIMESTEP_EMBEDDING: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -1722,7 +1722,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
-    constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
+    constexpr size_t compute_headroom = 32; // Includes recurrent rollback views created between evals.
     const ggml_init_params params_static = {
         /*.mem_size   =*/ n_tensors * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,

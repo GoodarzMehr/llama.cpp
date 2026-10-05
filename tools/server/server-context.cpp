@@ -235,6 +235,7 @@ struct server_slot {
 
     // speculative decoding
     common_speculative * spec;
+    bool spec_mtp = false;
 
     llama_tokens spec_draft;
 
@@ -454,6 +455,7 @@ struct server_slot {
 
         return task->type == other_slot.task->type
             && inp_embd.size() == other_slot.inp_embd.size()
+            && can_speculate() == other_slot.can_speculate()
             && are_lora_equal(lora, other_slot.lora);
     }
 
@@ -471,7 +473,8 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        // MTP cannot catch up on image or audio embeddings.
+        return spec && (!spec_mtp || !task || !task->tokens.has_media());
     }
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
@@ -566,6 +569,9 @@ struct server_slot {
 
             callback_on_reset(*this);
 
+            if (spec_mtp && !can_speculate()) {
+                prompt_clear();
+            }
             reset();
 
             callback_on_release(id);
@@ -769,7 +775,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                 struct cb_data_t {
                     common_speculative * spec;
                     llama_context * ctx;
-                } cb_data = { slot.spec, slot.ctx_tgt };
+                } cb_data = { slot.can_speculate() ? slot.spec : nullptr, slot.ctx_tgt };
 
                 static auto cb = [](const mtmd_helper_embd_batch * b, void * user_data) {
                     const auto * data = static_cast<cb_data_t *>(user_data);
@@ -1347,6 +1353,7 @@ private:
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
+            slot.spec_mtp = spec_mtp;
             slot.n_ctx   = n_ctx_slot();
 
             slot.mctx                   = mctx;
@@ -3913,7 +3920,7 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        if (spec && batch.slot_batched->can_speculate()) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
